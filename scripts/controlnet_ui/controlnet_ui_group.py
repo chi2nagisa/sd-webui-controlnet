@@ -149,6 +149,7 @@ class ControlNetUiGroup(object):
         self.upload_independent_img_in_img2img = None
         self.image_upload_panel = None
         self.save_detected_map = None
+        self.api_batch = None
 
         # Internal states for UI state pasting.
         self.prevent_next_n_module_update = 0
@@ -305,6 +306,12 @@ class ControlNetUiGroup(object):
                 value=False,
                 elem_classes=["cnet-preview-as-input"],
                 visible=False,
+            )
+            self.api_batch = gr.Checkbox(
+                label="Api Batch",
+                value=self.default_unit.api_batch,
+                elem_id=f"{elem_id_tabname}_{tabname}_controlnet_api_batch_checkbox",
+                visible=False
             )
 
         with gr.Row(elem_classes="controlnet_img2img_options"):
