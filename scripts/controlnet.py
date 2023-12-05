@@ -612,6 +612,7 @@ class Script(scripts.Script, metaclass=(
             else:
                 # api_batch
                 assert isinstance(image['image'], list)
+                assert len(image['image']) == p.batchsize
                 input_image = list()
                 for sub_image in image['image']:
                     if isinstance(sub_image, str):
@@ -681,7 +682,6 @@ class Script(scripts.Script, metaclass=(
         if sd_version != cnet_sd_version:
             raise Exception(f"ControlNet model {unit.model}({cnet_sd_version}) is not compatible with sd model({sd_version})")
 
-    # 所以这部分其实是Tab Batch Mode和Simple Mode共用的
     def controlnet_main_entry(self, p):
         sd_ldm = p.sd_model
         unet = sd_ldm.model.diffusion_model
