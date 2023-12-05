@@ -899,9 +899,9 @@ class Script(scripts.Script, metaclass=(
                 controls.append(control)
 
             if unit.api_batch:
-                control = torch.concat(controls*2, dim=0)
+                control = torch.concat(controls, dim=0)
                 if high_res_fix:
-                    hr_control = torch.concat(hr_controls * 2, dim=0)
+                    hr_control = torch.concat(hr_controls, dim=0)
                 else:
                     hr_control = None
             else:

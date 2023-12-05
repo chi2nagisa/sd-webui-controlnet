@@ -305,6 +305,12 @@ class ControlNet(nn.Module):
             emb = emb + self.label_emb(y)
 
         h = x
+
+        # align the batch size
+        repeats = int(h.shape[0] / guided_hint.shape[0])
+        if repeats != 1:
+            guided_hint = torch.concat([guided_hint] * repeats, dim=0)
+
         for module, zero_conv in zip(self.input_blocks, self.zero_convs):
             if guided_hint is not None:
                 h = module(h, emb, context)
