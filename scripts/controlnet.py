@@ -77,17 +77,29 @@ def swap_img2img_pipeline(p: processing.StableDiffusionProcessingImg2Img):
 global_state.update_cn_models()
 
 
-def image_dict_from_any(image) -> Optional[Dict[str, np.ndarray]]:
+def image_dict_from_any(image, api_batch=False) -> Optional[Dict[str, np.ndarray]]:
     if image is None:
         return None
 
-    if isinstance(image, (tuple, list)):
+    if not api_batch and isinstance(image, (tuple, list)):
         image = {'image': image[0], 'mask': image[1]}
     elif not isinstance(image, dict):
         image = {'image': image, 'mask': None}
     else:  # type(image) is dict
         # copy to enable modifying the dict and prevent response serialization error
         image = dict(image)
+
+    # api batch
+    if api_batch and isinstance(image['image'], list):
+        new_imgs = list()
+        for i, sub_image in enumerate(image['image']):
+            if os.path.exists(sub_image):
+                new_imgs.append(np.array(Image.open(sub_image)).astype('uint8'))
+            elif image['image']:
+                new_imgs.append(external_code.to_base64_nparray(sub_image))
+            else:
+                new_imgs.append(None)
+        image['image'] = new_imgs
 
     if isinstance(image['image'], str):
         if os.path.exists(image['image']):
@@ -110,7 +122,12 @@ def image_dict_from_any(image) -> Optional[Dict[str, np.ndarray]]:
         else:
             image['mask'] = np.zeros_like(image['image'], dtype=np.uint8)
     elif image['mask'] is None:
-        image['mask'] = np.zeros_like(image['image'], dtype=np.uint8)
+        if api_batch:
+            image['mask'] = list()
+            for i in range(len(image['image'])):
+                image['mask'].append(np.zeros_like(image['image'][i], dtype=np.uint8))
+        else:
+            image['mask'] = np.zeros_like(image['image'], dtype=np.uint8)
 
     return image
 
@@ -531,7 +548,7 @@ class Script(scripts.Script, metaclass=(
             p: processing.StableDiffusionProcessing, 
             unit: external_code.ControlNetUnit,
             idx: int
-        ) -> Tuple[np.ndarray, bool]:
+        ) -> Tuple[list, bool]:
         """ Choose input image from following sources with descending priority:
          - p.image_control: [Deprecated] Lagacy way to pass image to controlnet.
          - p.control_net_input_image: [Deprecated] Lagacy way to pass image to controlnet.
@@ -547,11 +564,11 @@ class Script(scripts.Script, metaclass=(
         image_from_a1111 = False
 
         p_input_image = Script.get_remote_call(p, "control_net_input_image", None, idx)
-        image = image_dict_from_any(unit.image)
+        image = image_dict_from_any(unit.image, unit.api_batch)
 
         if batch_hijack.instance.is_batch and getattr(p, "image_control", None) is not None:
             logger.warning("Warn: Using legacy field 'p.image_control'.")
-            input_image = HWC3(np.asarray(p.image_control))
+            input_image = [HWC3(np.asarray(p.image_control))]
         elif p_input_image is not None:
             logger.warning("Warn: Using legacy field 'p.controlnet_input_image'")
             if isinstance(p_input_image, dict) and "mask" in p_input_image and "image" in p_input_image:
@@ -560,35 +577,52 @@ class Script(scripts.Script, metaclass=(
                 input_image = np.concatenate([color, alpha], axis=2)
             else:
                 input_image = HWC3(np.asarray(p_input_image))
+            input_image = [input_image]
         elif image is not None:
-            while len(image['mask'].shape) < 3:
-                image['mask'] = image['mask'][..., np.newaxis]
+            if not unit.api_batch:
+                while len(image['mask'].shape) < 3:
+                    image['mask'] = image['mask'][..., np.newaxis]
 
-            # Need to check the image for API compatibility
-            if isinstance(image['image'], str):
-                from modules.api.api import decode_base64_to_image
-                input_image = HWC3(np.asarray(decode_base64_to_image(image['image'])))
-            else:
-                input_image = HWC3(image['image'])
-
-            have_mask = 'mask' in image and not (
-                (image['mask'][:, :, 0] <= 5).all() or 
-                (image['mask'][:, :, 0] >= 250).all()
-            )
-
-            if 'inpaint' in unit.module:
-                logger.info("using inpaint as input")
-                color = HWC3(image['image'])
-                if have_mask:
-                    alpha = image['mask'][:, :, 0:1]
+                # Need to check the image for API compatibility
+                if isinstance(image['image'], str):
+                    from modules.api.api import decode_base64_to_image
+                    input_image = HWC3(np.asarray(decode_base64_to_image(image['image'])))
                 else:
-                    alpha = np.zeros_like(color)[:, :, 0:1]
-                input_image = np.concatenate([color, alpha], axis=2)
+                    input_image = HWC3(image['image'])
+
+                have_mask = 'mask' in image and not (
+                    (image['mask'][:, :, 0] <= 5).all() or
+                    (image['mask'][:, :, 0] >= 250).all()
+                )
+
+                if 'inpaint' in unit.module:
+                    logger.info("using inpaint as input")
+                    color = HWC3(image['image'])
+                    if have_mask:
+                        alpha = image['mask'][:, :, 0:1]
+                    else:
+                        alpha = np.zeros_like(color)[:, :, 0:1]
+                    input_image = np.concatenate([color, alpha], axis=2)
+                else:
+                    if have_mask and not shared.opts.data.get("controlnet_ignore_noninpaint_mask", False):
+                        logger.info("using mask as input")
+                        input_image = HWC3(image['mask'][:, :, 0])
+                        unit.module = 'none'  # Always use black bg and white line
+                input_image = [input_image]
             else:
-                if have_mask and not shared.opts.data.get("controlnet_ignore_noninpaint_mask", False):
-                    logger.info("using mask as input")
-                    input_image = HWC3(image['mask'][:, :, 0])
-                    unit.module = 'none'  # Always use black bg and white line
+                # api_batch
+                assert isinstance(image['image'], list)
+                assert len(image['image']) == p.batch_size
+                input_image = list()
+                for sub_image in image['image']:
+                    if isinstance(sub_image, str):
+                        from modules.api.api import decode_base64_to_image
+                        input_image.append(HWC3(np.asarray(decode_base64_to_image(sub_image))))
+                    else:
+                        input_image.append(HWC3(sub_image))
+                if 'inpaint' in unit.module:
+                    raise NotImplementedError('api_batch do not support inpaint at this moment')
+
         else:
             # use img2img init_image as default
             input_image = getattr(p, "init_images", [None])[0]
@@ -597,10 +631,10 @@ class Script(scripts.Script, metaclass=(
                     shared.state.interrupted = True
                 raise ValueError('controlnet is enabled but no input image is given')
 
-            input_image = HWC3(np.asarray(input_image))
+            input_image = [HWC3(np.asarray(input_image))]
             image_from_a1111 = True
         
-        assert isinstance(input_image, np.ndarray)
+        assert isinstance(input_image, list)
         return input_image, image_from_a1111
     
     @staticmethod
@@ -705,57 +739,61 @@ class Script(scripts.Script, metaclass=(
                     bind_control_lora(unet, control_lora)
                     p.controlnet_control_loras.append(control_lora)
 
-            input_image, image_from_a1111 = Script.choose_input_image(p, unit, idx)
-            if image_from_a1111:
-                a1111_i2i_resize_mode = getattr(p, "resize_mode", None)
-                if a1111_i2i_resize_mode is not None:
-                    resize_mode = external_code.resize_mode_from_value(a1111_i2i_resize_mode)
-            
-            a1111_mask_image : Optional[Image.Image] = getattr(p, "image_mask", None)
-            if 'inpaint' in unit.module and not image_has_mask(input_image) and a1111_mask_image is not None:
-                a1111_mask = np.array(prepare_mask(a1111_mask_image, p))
-                if a1111_mask.ndim == 2:
-                    if a1111_mask.shape[0] == input_image.shape[0]:
-                        if a1111_mask.shape[1] == input_image.shape[1]:
-                            input_image = np.concatenate([input_image[:, :, 0:3], a1111_mask[:, :, None]], axis=2)
-                            a1111_i2i_resize_mode = getattr(p, "resize_mode", None)
-                            if a1111_i2i_resize_mode is not None:
-                                resize_mode = external_code.resize_mode_from_value(a1111_i2i_resize_mode)
+            input_images, image_from_a1111 = Script.choose_input_image(p, unit, idx)
 
-            if 'reference' not in unit.module and issubclass(type(p), StableDiffusionProcessingImg2Img) \
-                    and p.inpaint_full_res and a1111_mask_image is not None:
-                logger.debug("A1111 inpaint mask START")
-                input_image = [input_image[:, :, i] for i in range(input_image.shape[2])]
-                input_image = [Image.fromarray(x) for x in input_image]
+            for image_idx, input_image in enumerate(input_images):
+                if image_from_a1111:
+                    a1111_i2i_resize_mode = getattr(p, "resize_mode", None)
+                    if a1111_i2i_resize_mode is not None:
+                        resize_mode = external_code.resize_mode_from_value(a1111_i2i_resize_mode)
 
-                mask = prepare_mask(a1111_mask_image, p)
+                a1111_mask_image : Optional[Image.Image] = getattr(p, "image_mask", None)
+                if 'inpaint' in unit.module and not image_has_mask(input_image) and a1111_mask_image is not None:
+                    a1111_mask = np.array(prepare_mask(a1111_mask_image, p))
+                    if a1111_mask.ndim == 2:
+                        if a1111_mask.shape[0] == input_image.shape[0]:
+                            if a1111_mask.shape[1] == input_image.shape[1]:
+                                input_image = np.concatenate([input_image[:, :, 0:3], a1111_mask[:, :, None]], axis=2)
+                                a1111_i2i_resize_mode = getattr(p, "resize_mode", None)
+                                if a1111_i2i_resize_mode is not None:
+                                    resize_mode = external_code.resize_mode_from_value(a1111_i2i_resize_mode)
 
-                crop_region = masking.get_crop_region(np.array(mask), p.inpaint_full_res_padding)
-                crop_region = masking.expand_crop_region(crop_region, p.width, p.height, mask.width, mask.height)
+                if 'reference' not in unit.module and issubclass(type(p), StableDiffusionProcessingImg2Img) \
+                        and p.inpaint_full_res and a1111_mask_image is not None:
+                    logger.debug("A1111 inpaint mask START")
+                    input_image = [input_image[:, :, i] for i in range(input_image.shape[2])]
+                    input_image = [Image.fromarray(x) for x in input_image]
 
-                input_image = [
-                    images.resize_image(resize_mode.int_value(), i, mask.width, mask.height) 
-                    for i in input_image
-                ]
+                    mask = prepare_mask(a1111_mask_image, p)
 
-                input_image = [x.crop(crop_region) for x in input_image]
-                input_image = [
-                    images.resize_image(external_code.ResizeMode.OUTER_FIT.int_value(), x, p.width, p.height) 
-                    for x in input_image
-                ]
+                    crop_region = masking.get_crop_region(np.array(mask), p.inpaint_full_res_padding)
+                    crop_region = masking.expand_crop_region(crop_region, p.width, p.height, mask.width, mask.height)
 
-                input_image = [np.asarray(x)[:, :, 0] for x in input_image]
-                input_image = np.stack(input_image, axis=2)
-                logger.debug("A1111 inpaint mask END")
+                    input_image = [
+                        images.resize_image(resize_mode.int_value(), i, mask.width, mask.height)
+                        for i in input_image
+                    ]
 
-            if 'inpaint_only' == unit.module and issubclass(type(p), StableDiffusionProcessingImg2Img) and p.image_mask is not None:
-                logger.warning('A1111 inpaint and ControlNet inpaint duplicated. ControlNet support enabled.')
-                unit.module = 'inpaint'
+                    input_image = [x.crop(crop_region) for x in input_image]
+                    input_image = [
+                        images.resize_image(external_code.ResizeMode.OUTER_FIT.int_value(), x, p.width, p.height)
+                        for x in input_image
+                    ]
 
-            # safe numpy
-            logger.debug("Safe numpy convertion START")
-            input_image = np.ascontiguousarray(input_image.copy()).copy()
-            logger.debug("Safe numpy convertion END")
+                    input_image = [np.asarray(x)[:, :, 0] for x in input_image]
+                    input_image = np.stack(input_image, axis=2)
+                    logger.debug("A1111 inpaint mask END")
+
+                if 'inpaint_only' == unit.module and issubclass(type(p), StableDiffusionProcessingImg2Img) and p.image_mask is not None:
+                    logger.warning('A1111 inpaint and ControlNet inpaint duplicated. ControlNet support enabled.')
+                    unit.module = 'inpaint'
+
+                # safe numpy
+                logger.debug("Safe numpy convertion START")
+                input_image = np.ascontiguousarray(input_image.copy()).copy()
+                logger.debug("Safe numpy convertion END")
+
+                input_images[image_idx] = input_image
 
             logger.info(f"Loading preprocessor: {unit.module}")
             preprocessor = self.preprocessor[unit.module]
@@ -777,9 +815,11 @@ class Script(scripts.Script, metaclass=(
                 hr_y = h
                 hr_x = w
 
-            if unit.module == 'inpaint_only+lama' and resize_mode == external_code.ResizeMode.OUTER_FIT:
-                # inpaint_only+lama is special and required outpaint fix
-                _, input_image = Script.detectmap_proc(input_image, unit.module, resize_mode, hr_y, hr_x)
+            for image_idx, input_image in enumerate(input_images):
+                if unit.module == 'inpaint_only+lama' and resize_mode == external_code.ResizeMode.OUTER_FIT:
+                    # inpaint_only+lama is special and required outpaint fix
+                    _, input_image = Script.detectmap_proc(input_image, unit.module, resize_mode, hr_y, hr_x)
+                input_images[image_idx] = input_image
 
             control_model_type = ControlModelType.ControlNet
             global_average_pooling = False
@@ -800,55 +840,73 @@ class Script(scripts.Script, metaclass=(
             if control_model_type is ControlModelType.ControlNet:
                 global_average_pooling = model_net.control_model.global_average_pooling
 
-            preprocessor_resolution = unit.processor_res
-            if unit.pixel_perfect:
-                preprocessor_resolution = external_code.pixel_perfect_resolution(
-                    input_image,
-                    target_H=h,
-                    target_W=w,
-                    resize_mode=resize_mode
-                )
-
-            logger.info(f'preprocessor resolution = {preprocessor_resolution}')
             # Preprocessor result may depend on numpy random operations, use the
-            # random seed in `StableDiffusionProcessing` to make the 
+            # random seed in `StableDiffusionProcessing` to make the
             # preprocessor result reproducable.
             # Currently following preprocessors use numpy random:
             # - shuffle
             seed = set_numpy_seed(p)
             logger.debug(f"Use numpy seed {seed}.")
-            detected_map, is_image = preprocessor(
-                input_image, 
-                res=preprocessor_resolution, 
-                thr_a=unit.threshold_a,
-                thr_b=unit.threshold_b,
-            )
-            
-            def store_detected_map(detected_map, module: str) -> None:
-                if unit.save_detected_map:
-                    detected_maps.append((detected_map, module))
-            
-            if high_res_fix:
-                if is_image:
-                    hr_control, hr_detected_map = Script.detectmap_proc(detected_map, unit.module, resize_mode, hr_y, hr_x)
-                    store_detected_map(hr_detected_map, unit.module)
+
+            controls = list()
+            hr_controls = list()
+            preprocessor_resolution = unit.processor_res
+            for image_idx, input_image in enumerate(input_images):
+                if unit.pixel_perfect:
+                    preprocessor_resolution = external_code.pixel_perfect_resolution(
+                        input_image,
+                        target_H=h,
+                        target_W=w,
+                        resize_mode=resize_mode
+                    )
+                logger.info(f'preprocessor resolution = {preprocessor_resolution}')
+
+                detected_map, is_image = preprocessor(
+                    input_image,
+                    res=preprocessor_resolution,
+                    thr_a=unit.threshold_a,
+                    thr_b=unit.threshold_b,
+                )
+
+                def store_detected_map(detected_map, module: str) -> None:
+                    if unit.save_detected_map:
+                        detected_maps.append((detected_map, module))
+
+                if high_res_fix:
+                    if is_image:
+                        hr_control, hr_detected_map = Script.detectmap_proc(detected_map, unit.module, resize_mode, hr_y, hr_x)
+                        store_detected_map(hr_detected_map, unit.module)
+                    else:
+                        hr_control = detected_map
                 else:
-                    hr_control = detected_map
+                    hr_control = None
+                hr_controls.append(hr_control)
+
+                if is_image:
+                    control, detected_map = Script.detectmap_proc(detected_map, unit.module, resize_mode, h, w)
+                    store_detected_map(detected_map, unit.module)
+
+                else:
+                    control = detected_map
+                    store_detected_map(input_image, unit.module)
+
+                if control_model_type == ControlModelType.T2I_StyleAdapter:
+                    control = control['last_hidden_state']
+
+                if control_model_type == ControlModelType.ReVision:
+                    control = control['image_embeds']
+
+                controls.append(control)
+
+            if unit.api_batch:
+                control = torch.concat(controls, dim=0)
+                if high_res_fix:
+                    hr_control = torch.concat(hr_controls, dim=0)
+                else:
+                    hr_control = None
             else:
-                hr_control = None
-
-            if is_image:
-                control, detected_map = Script.detectmap_proc(detected_map, unit.module, resize_mode, h, w)
-                store_detected_map(detected_map, unit.module)
-            else:
-                control = detected_map
-                store_detected_map(input_image, unit.module)
-
-            if control_model_type == ControlModelType.T2I_StyleAdapter:
-                control = control['last_hidden_state']
-
-            if control_model_type == ControlModelType.ReVision:
-                control = control['image_embeds']
+                control = controls[0]
+                hr_control = hr_controls[0]
 
             preprocessor_dict = dict(
                 name=unit.module,

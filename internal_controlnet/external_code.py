@@ -139,7 +139,7 @@ def pixel_perfect_resolution(
     return int(np.round(estimation))
 
 
-InputImage = Union[np.ndarray, str]
+InputImage = Union[np.ndarray, str, List[str], List[np.ndarray]]
 InputImage = Union[Dict[str, InputImage], Tuple[InputImage, InputImage], InputImage]
 
 
@@ -162,6 +162,7 @@ class ControlNetUnit:
     guidance_end: float = 1.0
     pixel_perfect: bool = False
     control_mode: Union[ControlMode, int, str] = ControlMode.BALANCED
+    api_batch: bool = False
     
     # Whether save the detected map of this unit. Setting this option to False prevents saving the
     # detected map or sending detected map along with generated images via API.
