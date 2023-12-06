@@ -840,16 +840,6 @@ class Script(scripts.Script, metaclass=(
             if control_model_type is ControlModelType.ControlNet:
                 global_average_pooling = model_net.control_model.global_average_pooling
 
-            preprocessor_resolution = unit.processor_res
-            if unit.pixel_perfect:
-                preprocessor_resolution = external_code.pixel_perfect_resolution(
-                    input_images[0],
-                    target_H=h,
-                    target_W=w,
-                    resize_mode=resize_mode
-                )
-
-            logger.info(f'preprocessor resolution = {preprocessor_resolution}')
             # Preprocessor result may depend on numpy random operations, use the
             # random seed in `StableDiffusionProcessing` to make the
             # preprocessor result reproducable.
@@ -860,7 +850,17 @@ class Script(scripts.Script, metaclass=(
 
             controls = list()
             hr_controls = list()
+            preprocessor_resolution = unit.processor_res
             for image_idx, input_image in enumerate(input_images):
+                if unit.pixel_perfect:
+                    preprocessor_resolution = external_code.pixel_perfect_resolution(
+                        input_image,
+                        target_H=h,
+                        target_W=w,
+                        resize_mode=resize_mode
+                    )
+                logger.info(f'preprocessor resolution = {preprocessor_resolution}')
+
                 detected_map, is_image = preprocessor(
                     input_image,
                     res=preprocessor_resolution,
